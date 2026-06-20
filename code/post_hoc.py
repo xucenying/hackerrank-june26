@@ -8,7 +8,7 @@ import asyncio
 import json
 
 from image_utils import LoadedImage
-from prompts import ENUM_FIX_PROMPT_TEMPLATE, SYSTEM_PROMPT
+from prompts import ENUM_FIX_PROMPT_TEMPLATE
 from schemas import (
     ALL_OBJECT_PARTS,
     BOOL_STRINGS,
@@ -22,7 +22,7 @@ from schemas import (
     SEVERITIES,
     ClaimOutput,
 )
-from vlm_client import call_vlm
+from vlm_client import RunStats, call_vlm
 
 
 def _split_normalize(raw: object) -> list[str]:
@@ -35,11 +35,13 @@ def _coerce_text(raw: object, default: str) -> str:
 
 
 async def _request_fix(
+    claim_object: str,
     field_name: str,
     invalid_value: object,
     allowed: set[str],
     model_output: dict,
     semaphore: asyncio.Semaphore,
+    stats: RunStats,
 ) -> object | None:
     """One-shot retry: ask the model to correct a single invalid field."""
     fix_prompt = ENUM_FIX_PROMPT_TEMPLATE.format(
@@ -50,24 +52,26 @@ async def _request_fix(
     )
     async with semaphore:
         try:
-            fixed_response = await call_vlm(SYSTEM_PROMPT, fix_prompt, images=[])
+            fixed_response = await call_vlm(claim_object, fix_prompt, images=[], stats=stats)
         except Exception:
             return None
     return fixed_response.get(field_name)
 
 
 async def _coerce_scalar(
+    claim_object: str,
     field_name: str,
     raw: object,
     allowed: set[str],
     model_output: dict,
     semaphore: asyncio.Semaphore,
+    stats: RunStats,
 ) -> str:
     normalized = str(raw).strip().lower() if raw is not None else ""
     if normalized in allowed:
         return normalized
 
-    fixed = await _request_fix(field_name, raw, allowed, model_output, semaphore)
+    fixed = await _request_fix(claim_object, field_name, raw, allowed, model_output, semaphore, stats)
     if fixed is not None:
         fixed_normalized = str(fixed).strip().lower()
         if fixed_normalized in allowed:
@@ -77,17 +81,19 @@ async def _coerce_scalar(
 
 
 async def _coerce_list(
+    claim_object: str,
     field_name: str,
     raw: object,
     allowed: set[str],
     model_output: dict,
     semaphore: asyncio.Semaphore,
+    stats: RunStats,
 ) -> str:
     tokens = _split_normalize(raw)
     if tokens and all(token in allowed for token in tokens):
         return LIST_SEPARATOR.join(dict.fromkeys(tokens))
 
-    fixed = await _request_fix(field_name, raw, allowed, model_output, semaphore)
+    fixed = await _request_fix(claim_object, field_name, raw, allowed, model_output, semaphore, stats)
     if fixed is not None:
         fixed_tokens = _split_normalize(fixed)
         if fixed_tokens and all(token in allowed for token in fixed_tokens):
@@ -133,6 +139,7 @@ async def apply_post_hoc(
     valid_images: list[LoadedImage],
     invalid_paths: list[str],
     semaphore: asyncio.Semaphore,
+    stats: RunStats,
 ) -> ClaimOutput:
     """Stage 3: coerce model_output into allowed values, enforce logical
     consistency between fields, and merge in history-derived risk flags."""
@@ -142,32 +149,64 @@ async def apply_post_hoc(
     supporting_ids_allowed = valid_image_ids | {NO_SUPPORTING_IMAGES}
 
     evidence_standard_met = await _coerce_scalar(
-        "evidence_standard_met", model_output.get("evidence_standard_met"), BOOL_STRINGS, model_output, semaphore
+        claim_object,
+        "evidence_standard_met",
+        model_output.get("evidence_standard_met"),
+        BOOL_STRINGS,
+        model_output,
+        semaphore,
+        stats,
     )
     valid_image = await _coerce_scalar(
-        "valid_image", model_output.get("valid_image"), BOOL_STRINGS, model_output, semaphore
+        claim_object,
+        "valid_image",
+        model_output.get("valid_image"),
+        BOOL_STRINGS,
+        model_output,
+        semaphore,
+        stats,
     )
     claim_status = await _coerce_scalar(
-        "claim_status", model_output.get("claim_status"), CLAIM_STATUSES, model_output, semaphore
+        claim_object,
+        "claim_status",
+        model_output.get("claim_status"),
+        CLAIM_STATUSES,
+        model_output,
+        semaphore,
+        stats,
     )
     issue_type = await _coerce_scalar(
-        "issue_type", model_output.get("issue_type"), ISSUE_TYPES, model_output, semaphore
+        claim_object,
+        "issue_type",
+        model_output.get("issue_type"),
+        ISSUE_TYPES,
+        model_output,
+        semaphore,
+        stats,
     )
     object_part = await _coerce_scalar(
-        "object_part", model_output.get("object_part"), object_part_allowed, model_output, semaphore
+        claim_object,
+        "object_part",
+        model_output.get("object_part"),
+        object_part_allowed,
+        model_output,
+        semaphore,
+        stats,
     )
     severity = await _coerce_scalar(
-        "severity", model_output.get("severity"), SEVERITIES, model_output, semaphore
+        claim_object, "severity", model_output.get("severity"), SEVERITIES, model_output, semaphore, stats
     )
     risk_flags = await _coerce_list(
-        "risk_flags", model_output.get("risk_flags"), RISK_FLAGS, model_output, semaphore
+        claim_object, "risk_flags", model_output.get("risk_flags"), RISK_FLAGS, model_output, semaphore, stats
     )
     supporting_image_ids = await _coerce_list(
+        claim_object,
         "supporting_image_ids",
         model_output.get("supporting_image_ids"),
         supporting_ids_allowed,
         model_output,
         semaphore,
+        stats,
     )
 
     evidence_standard_met_reason = _coerce_text(

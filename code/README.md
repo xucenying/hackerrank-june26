@@ -8,7 +8,7 @@ are then validated and normalized in a deterministic post-hoc pass.
 ## Install
 
 ```bash
-pip install anthropic pandas python-dotenv tqdm
+pip install anthropic pandas python-dotenv tqdm pillow
 ```
 
 Create a `.env` file in the repo root (never commit it):

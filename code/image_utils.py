@@ -1,10 +1,18 @@
-"""Image loading and base64 encoding for the VLM pipeline. Stdlib only (pathlib + base64)."""
+"""Image loading and base64 encoding for the VLM pipeline.
+
+Stdlib (pathlib + base64) plus Pillow, used only to transcode AVIF source images --
+the Anthropic API accepts jpeg/png/gif/webp but not avif, and some of this dataset's
+".jpg"-named files are actually AVIF under the hood.
+"""
 
 from __future__ import annotations
 
 import base64
+import io
 from dataclasses import dataclass
 from pathlib import Path
+
+from PIL import Image
 
 # Matches the separator used for image_paths, risk_flags, and supporting_image_ids.
 LIST_SEPARATOR = ";"
@@ -34,6 +42,32 @@ def _sniff_media_type(data: bytes) -> str | None:
     if data.startswith(b"RIFF") and data[8:12] == b"WEBP":
         return "image/webp"
     return None
+
+
+def _is_avif(data: bytes) -> bool:
+    """AVIF is an ISO-BMFF container: a 4-byte box size, then b"ftyp", then a brand
+    of "avif" (still image) or "avis" (image sequence). Some files in this dataset
+    are named ".jpg" but are actually AVIF, which the Anthropic API doesn't accept."""
+    return len(data) >= 12 and data[4:8] == b"ftyp" and data[8:12] in (b"avif", b"avis")
+
+
+# Anthropic resizes any image larger than this on the longest edge before inference
+# anyway, so downscaling here only saves upload size/tokens -- it doesn't lose
+# anything the model would have used. Also keeps re-encoded AVIF photos well under
+# the API's 10 MB per-image limit (a 3000x4512 source re-encoded as PNG can exceed it).
+MAX_IMAGE_DIMENSION = 1568
+
+
+def _convert_avif_to_jpeg(data: bytes) -> bytes:
+    """Decode AVIF, downscale if needed, and re-encode as JPEG so the Anthropic API
+    can accept it. JPEG (not PNG) because these are photos, where lossy compression
+    keeps re-encoded file size far below the API's 10 MB limit."""
+    with Image.open(io.BytesIO(data)) as image:
+        rgb_image = image.convert("RGB")
+        rgb_image.thumbnail((MAX_IMAGE_DIMENSION, MAX_IMAGE_DIMENSION), Image.LANCZOS)
+        buffer = io.BytesIO()
+        rgb_image.save(buffer, format="JPEG", quality=90)
+        return buffer.getvalue()
 
 
 @dataclass
@@ -68,10 +102,17 @@ def load_image(path: Path) -> LoadedImage:
     Raises FileNotFoundError, OSError, or ValueError (unrecognized image format)
     if the image can't be read. Callers treat any of these as an invalid path.
     """
-    data = path.read_bytes()
-    media_type = _sniff_media_type(data) or MEDIA_TYPE_BY_SUFFIX.get(path.suffix.lower())
-    if media_type is None:
-        raise ValueError(f"Unrecognized image format: {path}")
+    if not path.exists():
+        raise FileNotFoundError(f"Image not found: {path}")
+    with open(path, "rb") as f:
+        data = f.read()
+    if _is_avif(data):
+        data = _convert_avif_to_jpeg(data)
+        media_type = "image/jpeg"
+    else:
+        media_type = _sniff_media_type(data) or MEDIA_TYPE_BY_SUFFIX.get(path.suffix.lower())
+        if media_type is None:
+            raise ValueError(f"Unrecognized image format: {path}")
     encoded = base64.b64encode(data).decode("ascii")
     return LoadedImage(
         image_id=image_id_from_path(path),
